@@ -1,0 +1,52 @@
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    hostname: price-monitor
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY}
+      TS_STATE_DIR: /var/lib/tailscale
+    volumes:
+      - tailscale_state:/var/lib/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    restart: unless-stopped
+
+  api:
+    build: .
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    env_file: .env
+    environment:
+      PRICE_MONITOR_DATABASE_URL: sqlite:////app/data/price_monitor.db
+      PRICE_MONITOR_USE_BROWSER: "true"
+      PRICE_MONITOR_BROWSER_HEADLESS: "true"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://127.0.0.1:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    command: ["python", "-m", "price_monitor.cli", "daemon", "--interval-hours", "24"]
+    env_file: .env
+    environment:
+      PRICE_MONITOR_DATABASE_URL: sqlite:////app/data/price_monitor.db
+      PRICE_MONITOR_USE_BROWSER: "true"
+      PRICE_MONITOR_BROWSER_HEADLESS: "true"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  tailscale_state:
