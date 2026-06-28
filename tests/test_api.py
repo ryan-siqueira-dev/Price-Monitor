@@ -80,7 +80,12 @@ def test_create_and_list_product():
 
             response = await client.get("/providers/status")
             assert response.status_code == 200
-            assert len(response.json()) == 6
+            assert [item["provider"] for item in response.json()] == [
+                "OLX",
+                "Amazon",
+                "KaBuM",
+                "Carrefour",
+            ]
 
             response = await client.get("/products")
             assert response.status_code == 200

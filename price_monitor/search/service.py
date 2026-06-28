@@ -11,7 +11,6 @@ from price_monitor.search.base import (
 from price_monitor.search.matching import is_relevant_offer
 from price_monitor.search.providers import (
     BrowserSearchProvider,
-    MercadoLivreSearchProvider,
     VtexSearchProvider,
     browser_profiles,
 )
@@ -21,7 +20,6 @@ logger = logging.getLogger(__name__)
 
 def default_search_providers(settings: Settings) -> list[SearchProvider]:
     providers: list[SearchProvider] = [
-        MercadoLivreSearchProvider(settings),
         VtexSearchProvider("Carrefour", "https://www.carrefour.com.br", settings),
     ]
     if settings.use_browser:
@@ -30,7 +28,7 @@ def default_search_providers(settings: Settings) -> list[SearchProvider]:
 
 
 def search_provider_names() -> list[str]:
-    return ["Mercado Livre", "OLX", "Amazon", "Magalu", "KaBuM", "Carrefour"]
+    return ["OLX", "Amazon", "KaBuM", "Carrefour"]
 
 
 class ProductSearch:

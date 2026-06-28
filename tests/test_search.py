@@ -1,13 +1,11 @@
+import json
 from decimal import Decimal
 
-import httpx
-
 from price_monitor.config import Settings
-from price_monitor.search.base import SearchError, SearchOffer
+from price_monitor.search.base import SearchError, SearchLocation, SearchOffer
 from price_monitor.search.matching import is_relevant_offer
 from price_monitor.search.providers import (
     BrowserSearchProvider,
-    MercadoLivreSearchProvider,
     browser_profiles,
     parse_vtex_products,
 )
@@ -26,19 +24,21 @@ class FakeProvider:
         return self.offers
 
 
-class FakeAuth:
-    def access_token(self):
-        return "token"
-
-
 def offer(title, price="100.00", url="https://example.com/product", store="Teste"):
     return SearchOffer("external-id", title, Decimal(price), "BRL", url, store)
 
 
 def test_matching_rejects_accessory_for_main_product_query():
     assert is_relevant_offer("ThinkPad T14", offer("Notebook Lenovo ThinkPad T14"))
+    assert is_relevant_offer(
+        "ThinkPad T14", offer("Notebook Lenovo ThinkPad T14 com SSD e tela touch")
+    )
     assert not is_relevant_offer("ThinkPad T14", offer("Cooler para ThinkPad T14"))
+    assert not is_relevant_offer("ThinkPad T14", offer("Teclado para notebook ThinkPad T14"))
+    assert not is_relevant_offer("ThinkPad T14", offer("Placa mãe Lenovo ThinkPad T14"))
+    assert not is_relevant_offer("ThinkPad T14", offer("Tampa com LCD ThinkPad T14"))
     assert is_relevant_offer("cooler ThinkPad T14", offer("Cooler para ThinkPad T14"))
+    assert is_relevant_offer("teclado ThinkPad T14", offer("Teclado para ThinkPad T14"))
 
 
 def test_product_search_combines_filters_and_sorts_providers():
@@ -107,7 +107,8 @@ def test_parse_vtex_products_uses_lowest_available_price():
 def test_browser_provider_parses_kabum_cards(monkeypatch):
     html = """
     <a href="/produto/123/notebook-thinkpad-t14">
-      <h2>Notebook Lenovo ThinkPad T14</h2>
+      <img alt="">
+      <span class="text-ellipsis">Notebook Lenovo ThinkPad T14 usado</span>
       <span>R$ 2.999,90 no PIX</span>
     </a>
     """
@@ -128,35 +129,60 @@ def test_browser_provider_parses_kabum_cards(monkeypatch):
     assert len(offers) == 1
     assert captured["url"] == "https://www.kabum.com.br/busca/ThinkPad-T14"
     assert offers[0].price == Decimal("2999.90")
+    assert offers[0].condition == "usado"
     assert offers[0].url == "https://www.kabum.com.br/produto/123/notebook-thinkpad-t14"
 
 
-def test_mercado_livre_provider_parses_api_results():
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Authorization"] == "Bearer token"
-        return httpx.Response(
-            200,
-            json={
-                "results": [
-                    {
-                        "id": "MLB123",
-                        "title": "Notebook Lenovo ThinkPad T14 usado",
-                        "price": 2750,
-                        "currency_id": "BRL",
-                        "permalink": "https://produto.mercadolivre.com.br/MLB123",
-                        "condition": "used",
-                        "address": {"city_name": "Itajaí", "state_id": "BR-SC"},
-                    }
-                ]
-            },
-        )
-
-    provider = MercadoLivreSearchProvider(
-        Settings(_env_file=None), transport=httpx.MockTransport(handler), auth=FakeAuth()
-    )
+def test_browser_provider_parses_amazon_link_and_removes_tracking_query(monkeypatch):
+    html = """
+    <div data-component-type="s-search-result">
+      <a class="a-link-normal s-no-outline"
+         href="/Lenovo-ThinkPad/dp/B0123/ref=sr_1?tag=tracking"></a>
+      <h2><span>Notebook Lenovo ThinkPad T14</span></h2>
+      <span class="a-price"><span class="a-offscreen">R$ 4.999,00</span></span>
+    </div>
+    """
+    profile = next(item for item in browser_profiles() if item.name == "Amazon")
+    provider = BrowserSearchProvider(profile, Settings(_env_file=None))
+    monkeypatch.setattr(provider, "_fetch", lambda _url: html)
 
     offers = provider.search("ThinkPad T14")
 
     assert len(offers) == 1
-    assert offers[0].external_id == "MLB123"
-    assert offers[0].condition == "usado"
+    assert offers[0].price == Decimal("4999.00")
+    assert offers[0].external_id == "B0123"
+    assert offers[0].url == "https://www.amazon.com.br/dp/B0123"
+
+
+def test_browser_provider_parses_and_filters_olx_next_data(monkeypatch):
+    ads = [
+        {
+            "subject": "Lenovo ThinkPad T14 usado",
+            "priceValue": "R$ 2.550",
+            "listId": 123,
+            "url": "https://sc.olx.com.br/thinkpad-t14-123?lis=search",
+            "category": "Notebooks",
+            "locationDetails": {"municipality": "Itajaí", "uf": "SC"},
+        },
+        {
+            "subject": "Lenovo ThinkPad T14",
+            "priceValue": "R$ 2.400",
+            "listId": 456,
+            "url": "https://sc.olx.com.br/thinkpad-t14-456",
+            "locationDetails": {"municipality": "Florianópolis", "uf": "SC"},
+        },
+    ]
+    payload = {"props": {"pageProps": {"ads": ads}}}
+    html = f'<script id="__NEXT_DATA__" type="application/json">{json.dumps(payload)}</script>'
+    profile = next(item for item in browser_profiles() if item.name == "OLX")
+    provider = BrowserSearchProvider(profile, Settings(_env_file=None))
+    monkeypatch.setattr(provider, "_fetch", lambda _url: html)
+
+    offers = provider.search("ThinkPad T14", SearchLocation("Itajai", "sc"))
+
+    assert len(offers) == 1
+    assert offers[0].external_id == "123"
+    assert offers[0].price == Decimal("2550.00")
+    assert offers[0].city == "Itajaí"
+    assert offers[0].state == "SC"
+    assert offers[0].url == "https://sc.olx.com.br/thinkpad-t14-123"

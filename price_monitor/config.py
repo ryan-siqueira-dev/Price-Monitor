@@ -21,10 +21,6 @@ class Settings(BaseSettings):
     default_state: str = Field(default="SC", min_length=2, max_length=2)
     auth_dir: Path = Path("data/auth")
     browser_headless: bool = True
-    mercado_livre_client_id: str | None = None
-    mercado_livre_client_secret: str | None = None
-    mercado_livre_redirect_uri: str = "http://127.0.0.1:8766/callback"
-    mercado_livre_access_token: str | None = None
     user_agent: str = (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"

@@ -11,11 +11,6 @@ class StoreProfile:
 
 STORE_PROFILES = (
     StoreProfile(
-        "Mercado Livre",
-        ("mercadolivre.com.br",),
-        (".ui-pdp-price__second-line .andes-money-amount__fraction",),
-    ),
-    StoreProfile(
         "Amazon Brasil",
         ("amazon.com.br",),
         ("#corePrice_feature_div .a-offscreen", ".priceToPay .a-offscreen"),
@@ -34,11 +29,6 @@ STORE_PROFILES = (
         "TerabyteShop",
         ("terabyteshop.com.br",),
         (".valVista", ".prod-new-price"),
-    ),
-    StoreProfile(
-        "Magazine Luiza",
-        ("magazineluiza.com.br",),
-        ('[data-testid="price-value"]', '[data-testid="price"]'),
     ),
     StoreProfile("Shopee", ("shopee.com.br",)),
     StoreProfile("AliExpress", ("aliexpress.com",)),

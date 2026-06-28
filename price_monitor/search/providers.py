@@ -1,18 +1,19 @@
 import hashlib
+import json
 import os
 import re
+import unicodedata
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, quote_plus, urljoin
+from urllib.parse import quote, quote_plus, urljoin, urlsplit, urlunsplit
 
 import httpx
 from bs4 import BeautifulSoup, Tag
 
 from price_monitor.config import Settings
 from price_monitor.scrapers.parser import parse_price
-from price_monitor.search.auth import MercadoLivreAuth
 from price_monitor.search.base import SearchError, SearchLocation, SearchOffer
 
 BLOCK_MARKERS = (
@@ -20,6 +21,7 @@ BLOCK_MARKERS = (
     "acesso negado",
     "captcha",
     "desafio abaixo",
+    "não é possível acessar a página",
     "página indisponível",
     "pagina indisponivel",
     "tráfego incomum",
@@ -36,6 +38,31 @@ def _positive_price(value: Any) -> Decimal | None:
 
 def _external_id(url: str) -> str:
     return hashlib.sha256(url.encode()).hexdigest()[:32]
+
+
+def _canonical_url(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def _normalized(value: str) -> str:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(character for character in decomposed if not unicodedata.combining(character))
+
+
+def _browser_identity(store: str, url: str) -> tuple[str, str]:
+    canonical = _canonical_url(url)
+    patterns = {
+        "Amazon": r"/dp/([A-Za-z0-9]+)",
+        "KaBuM": r"/produto/(\d+)",
+    }
+    match = re.search(patterns[store], canonical) if store in patterns else None
+    if match is None:
+        return _external_id(canonical), canonical
+    external_id = match.group(1)
+    if store == "Amazon":
+        canonical = f"https://www.amazon.com.br/dp/{external_id}"
+    return external_id, canonical
 
 
 def infer_condition(title: str, raw: str | None = None) -> str:
@@ -101,6 +128,62 @@ def parse_vtex_products(data: Any, store: str) -> list[SearchOffer]:
     return offers
 
 
+def parse_olx_results(
+    html: str, location: SearchLocation | None, max_results: int
+) -> list[SearchOffer]:
+    soup = BeautifulSoup(html, "html.parser")
+    script = soup.select_one("#__NEXT_DATA__")
+    if script is None:
+        raise SearchError("OLX: dados de resultados não encontrados; execute auth setup")
+    try:
+        payload = json.loads(script.string or script.get_text())
+        ads = payload["props"]["pageProps"]["ads"]
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise SearchError("OLX: formato dos resultados mudou") from exc
+    if not isinstance(ads, list):
+        raise SearchError("OLX: lista de resultados inválida")
+
+    offers: list[SearchOffer] = []
+    for ad in ads:
+        if not isinstance(ad, dict):
+            continue
+        title = str(ad.get("subject") or "").strip()
+        url = _canonical_url(str(ad.get("url") or "").strip())
+        price = _positive_price(ad.get("priceValue") or ad.get("price"))
+        details = ad.get("locationDetails") or {}
+        if not isinstance(details, dict):
+            details = {}
+        city = str(details.get("municipality") or "").strip() or None
+        state = str(details.get("uf") or "").strip().upper() or None
+        category = str(ad.get("category") or ad.get("categoryName") or "").strip()
+        if location and (
+            city is None
+            or state is None
+            or _normalized(city) != _normalized(location.city)
+            or state != location.state.upper()
+        ):
+            continue
+        if not title or not url or price is None:
+            continue
+        offers.append(
+            SearchOffer(
+                str(ad.get("listId") or _external_id(url)),
+                title,
+                price,
+                "BRL",
+                url,
+                "OLX",
+                infer_condition(title),
+                city,
+                state,
+                (category,) if category else (),
+            )
+        )
+        if len(offers) >= max_results:
+            break
+    return offers
+
+
 class VtexSearchProvider:
     def __init__(
         self,
@@ -136,65 +219,6 @@ class VtexSearchProvider:
                 return parse_vtex_products(response.json(), self.name)
         except (httpx.HTTPError, ValueError) as exc:
             raise SearchError(f"{self.name}: falha no catálogo ({exc})") from exc
-
-
-class MercadoLivreSearchProvider:
-    name = "Mercado Livre"
-    endpoint = "https://api.mercadolibre.com/sites/MLB/search"
-
-    def __init__(
-        self,
-        settings: Settings,
-        transport: httpx.BaseTransport | None = None,
-        auth: MercadoLivreAuth | None = None,
-    ):
-        self.settings = settings
-        self.transport = transport
-        self.auth = auth or MercadoLivreAuth(settings, transport)
-
-    def search(self, query: str, location: SearchLocation | None = None) -> list[SearchOffer]:
-        token = self.auth.access_token()
-        try:
-            with httpx.Client(
-                timeout=self.settings.request_timeout_seconds, transport=self.transport
-            ) as client:
-                response = client.get(
-                    self.endpoint,
-                    headers={"Authorization": f"Bearer {token}"},
-                    params={"q": query, "limit": self.settings.search_max_results_per_store},
-                )
-                response.raise_for_status()
-                payload = response.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            raise SearchError(f"Mercado Livre: falha na API ({exc})") from exc
-
-        offers: list[SearchOffer] = []
-        for item in payload.get("results") or ():
-            if not isinstance(item, dict):
-                continue
-            title = str(item.get("title") or "").strip()
-            url = str(item.get("permalink") or "").strip()
-            price = _positive_price(item.get("price"))
-            item_id = str(item.get("id") or _external_id(url))
-            address = item.get("address") or {}
-            city = str(address.get("city_name") or "").strip() or None
-            state = str(address.get("state_id") or "").removeprefix("BR-") or None
-            if not title or not url or price is None:
-                continue
-            offers.append(
-                SearchOffer(
-                    item_id,
-                    title,
-                    price,
-                    str(item.get("currency_id") or "BRL")[:3],
-                    url,
-                    self.name,
-                    infer_condition(title, str(item.get("condition") or "")),
-                    city,
-                    state,
-                )
-            )
-        return offers
 
 
 @dataclass(frozen=True, slots=True)
@@ -255,21 +279,29 @@ class BrowserSearchProvider:
             return ""
         return str(element.get("alt") or element.get_text(" ", strip=True)).strip()
 
+    @classmethod
+    def _first_text(cls, card: Tag, selector: str) -> str:
+        for element in card.select(selector):
+            text = cls._element_text(element)
+            if text:
+                return text
+        return ""
+
     def search(self, query: str, location: SearchLocation | None = None) -> list[SearchOffer]:
-        location_query = (
-            f" {location.city} {location.state}" if location and self.name == "OLX" else ""
-        )
-        encoded_query = quote_plus(query + location_query)
-        if self.name in {"Magalu", "KaBuM"}:
+        encoded_query = quote_plus(query)
+        if self.name == "KaBuM":
             encoded_query = quote("-".join(query.split()), safe="-")
         url = self.profile.search_url.format(query=encoded_query)
-        soup = BeautifulSoup(self._fetch(url), "html.parser")
+        html = self._fetch(url)
+        if self.name == "OLX":
+            return parse_olx_results(html, location, self.settings.search_max_results_per_store)
+        soup = BeautifulSoup(html, "html.parser")
         offers: list[SearchOffer] = []
         seen: set[str] = set()
         for card in soup.select(self.profile.card_selector):
-            title = self._element_text(card.select_one(self.profile.title_selector))
+            title = self._first_text(card, self.profile.title_selector)
             if self.profile.price_selector:
-                price_text = self._element_text(card.select_one(self.profile.price_selector))
+                price_text = self._first_text(card, self.profile.price_selector)
             else:
                 card_text = self._element_text(card)
                 marker = card_text.find("R$")
@@ -279,7 +311,9 @@ class BrowserSearchProvider:
             if link is None and self.profile.link_selector:
                 link = card.select_one(self.profile.link_selector)
             href = str(link.get("href") or "").strip() if link else ""
-            offer_url = urljoin(self.profile.home_url, href)
+            external_id, offer_url = _browser_identity(
+                self.name, urljoin(self.profile.home_url, href)
+            )
             location_text = self._element_text(
                 card.select_one(self.profile.location_selector)
                 if self.profile.location_selector
@@ -290,13 +324,13 @@ class BrowserSearchProvider:
             if (
                 location
                 and location_text
-                and location.city.casefold() not in location_text.casefold()
+                and _normalized(location.city) not in _normalized(location_text)
             ):
                 continue
             seen.add(offer_url)
             offers.append(
                 SearchOffer(
-                    _external_id(offer_url),
+                    external_id,
                     title,
                     price,
                     "BRL",
@@ -331,23 +365,14 @@ def browser_profiles() -> list[BrowserSearchProfile]:
             '[data-component-type="s-search-result"]',
             "h2 span",
             ".a-price .a-offscreen",
-            "h2 a",
-        ),
-        BrowserSearchProfile(
-            "Magalu",
-            "https://www.magazineluiza.com.br",
-            "https://www.magazineluiza.com.br/busca/{query}/",
-            '[data-testid="product-card-content"], a[data-testid="product-card-container"]',
-            '[data-testid="product-title"], h2',
-            '[data-testid="price-value"]',
-            "a[href]",
+            'a.a-link-normal[href*="/dp/"]',
         ),
         BrowserSearchProfile(
             "KaBuM",
             "https://www.kabum.com.br",
             "https://www.kabum.com.br/busca/{query}",
             'a[href*="/produto/"]',
-            "h2, h3, img[alt]",
+            ".text-ellipsis, h2, h3, img[alt]",
             None,
         ),
     ]

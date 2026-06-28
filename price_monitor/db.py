@@ -43,9 +43,14 @@ def init_db(target_engine: Engine = engine) -> None:
 
 
 def migrate_db() -> None:
-    config_path = Path(__file__).resolve().parent.parent / "alembic.ini"
-    if not config_path.exists():
-        raise RuntimeError(f"arquivo de migração não encontrado: {config_path}")
+    candidates = (
+        Path.cwd() / "alembic.ini",
+        Path(__file__).resolve().parent.parent / "alembic.ini",
+    )
+    config_path = next((path for path in candidates if path.exists()), None)
+    if config_path is None:
+        searched = ", ".join(str(path) for path in candidates)
+        raise RuntimeError(f"arquivo de migração não encontrado; caminhos verificados: {searched}")
     config = Config(str(config_path))
     config.set_main_option("sqlalchemy.url", get_settings().database_url)
     command.upgrade(config, "head")
